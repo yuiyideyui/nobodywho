@@ -1,0 +1,35 @@
+name: Build GDExtension Plugin
+
+on: [push, pull_request]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive # 确保下载了 llama.cpp 源码
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Vulkan SDK
+        run: |
+          curl -L -o VulkanSDK-Installer.exe https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe
+          ./VulkanSDK-Installer.exe --root C:\VulkanSDK --accept-licenses --default-answer --confirm-command install
+          echo "VULKAN_SDK=C:\VulkanSDK" >> $GITHUB_ENV
+          echo "C:\VulkanSDK\Bin" >> $GITHUB_PATH
+
+      - name: Build Release
+        run: cargo build --release
+        env:
+          # 强制开启 Vulkan 加速，确保支持 4070Ti 并行
+          CMAKE_ARGS: "-DGGML_VULKAN=ON" 
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-dll
+          path: target/release/*.dll
