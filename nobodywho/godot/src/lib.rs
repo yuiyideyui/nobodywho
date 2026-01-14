@@ -207,13 +207,17 @@ impl NobodyWhoChat {
     #[func]
     fn say(&mut self, message: String) {
         godot_warn!("DEPRECATED: the `say` function has been renamed to `ask`, to indicate that it generates a response. `say` will be removed in the future.");
-        self.ask(message)
+        // Maintain backward compatibility by defaulting to sync
+        self.ask(message, false)
     }
 
     #[func]
     /// Sends a message to the LLM.
     /// This will start the inference process. meaning you can also listen on the `response_updated` and `response_finished` signals to get the response.
-    fn ask(&mut self, message: String) {
+    ///
+    /// If `is_async` is true, the request will be queued asynchronously, preventing the main thread from freezing while waiting for the model lock.
+    /// This is useful when you have multiple AI instances querying at the same time.
+    fn ask(&mut self, message: String, is_async: bool) {
         let Some(chat_handle) = self.chat_handle.as_ref() else {
             godot_warn!("Worker was not started yet, starting now... You may want to call `start_worker()` ahead of time to avoid waiting.");
             match self.start_worker_impl() {
@@ -221,26 +225,65 @@ impl NobodyWhoChat {
                     godot_error!("Failed auto-starting the worker: {}", msg);
                     return;
                 }
-                Ok(_) => return self.ask(message),
+                Ok(_) => return self.ask(message, is_async),
             };
         };
 
         let emit_node = self.to_gd();
-        let mut generation_channel = chat_handle.ask_channel(message);
-        godot::task::spawn(async move {
-            while let Some(out) = generation_channel.recv().await {
-                match out {
-                    nobodywho::llm::WriteOutput::Token(tok) => emit_node
-                        .signals()
-                        .response_updated()
-                        .emit(&GString::from(tok.as_str())),
-                    nobodywho::llm::WriteOutput::Done(resp) => emit_node
-                        .signals()
-                        .response_finished()
-                        .emit(&GString::from(resp.as_str())),
+        let message_clone = message.clone();
+        let chat_handle_clone = chat_handle.clone();
+
+        if is_async {
+            godot::task::spawn(async move {
+                // Offload the blocking ask_channel call to a separate thread
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                
+                std::thread::spawn(move || {
+                    let generation_channel = chat_handle_clone.ask_channel(message_clone);
+                    let _ = tx.send(generation_channel);
+                });
+
+                // Wait for the channel to be created (non-blocking for Godot)
+                let mut generation_channel = match rx.await {
+                    Ok(channel) => channel,
+                    Err(_) => {
+                        godot_error!("Failed to receive generation channel from thread.");
+                        return;
+                    }
+                };
+                
+                // Process the response
+                while let Some(out) = generation_channel.recv().await {
+                    match out {
+                        nobodywho::llm::WriteOutput::Token(tok) => emit_node
+                            .signals()
+                            .response_updated()
+                            .emit(&GString::from(tok.as_str())),
+                        nobodywho::llm::WriteOutput::Done(resp) => emit_node
+                            .signals()
+                            .response_finished()
+                            .emit(&GString::from(resp.as_str())),
+                    }
                 }
-            }
-        });
+            });
+        } else {
+            // Existing synchronous behavior
+            let mut generation_channel = chat_handle.ask_channel(message);
+            godot::task::spawn(async move {
+                while let Some(out) = generation_channel.recv().await {
+                    match out {
+                        nobodywho::llm::WriteOutput::Token(tok) => emit_node
+                            .signals()
+                            .response_updated()
+                            .emit(&GString::from(tok.as_str())),
+                        nobodywho::llm::WriteOutput::Done(resp) => emit_node
+                            .signals()
+                            .response_finished()
+                            .emit(&GString::from(resp.as_str())),
+                    }
+                }
+            });
+        }
     }
 
     #[func]
